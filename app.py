@@ -324,7 +324,7 @@ def sync_abandoned_checkouts():
         print("[SYNC] SHOPIFY_STORE or SHOPIFY_ADMIN_TOKEN not set")
         return jsonify({"error": "SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN env vars required"}), 500
 
-    body       = request.get_json(force=True) or {}
+    body       = request.get_json(force=True, silent=True) or {}
     max_limit  = body.get("limit", None)   # optional: stop after N checkouts
     since_date = body.get("since", None)   # optional: only after this date e.g. "2026-01-01"
 
