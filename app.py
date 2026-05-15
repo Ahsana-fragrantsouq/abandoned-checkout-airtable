@@ -178,6 +178,10 @@ def abandoned_checkout():
 
     checkout = request.get_json(force=True)
     if not checkout:
+        # Skip if checkout was already completed (became an order)
+        if checkout.get("completed_at"):
+            print(f"[WEBHOOK] Checkout {checkout.get('id')} already completed — skipping")
+            return jsonify({"skipped": "checkout already completed"}), 200
         print("[WEBHOOK] No JSON payload")
         return jsonify({"error": "No payload"}), 400
 
