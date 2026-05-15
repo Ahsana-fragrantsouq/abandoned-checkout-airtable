@@ -3,6 +3,7 @@ import hmac
 import hashlib
 import base64
 import logging
+import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
@@ -17,11 +18,17 @@ app = Flask(__name__)
 AIRTABLE_TOKEN    = os.environ["AIRTABLE_TOKEN"]
 AIRTABLE_BASE_ID  = os.environ["AIRTABLE_BASE_ID"]
 SHOPIFY_SECRET    = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
+SHOPIFY_STORE     = os.environ.get("SHOPIFY_STORE", "")          # e.g. fragrantsouq.myshopify.com
+SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")  # shpat_...
 
 AT_BASE = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
 AT_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
     "Content-Type":  "application/json",
+}
+SHOPIFY_HEADERS = {
+    "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    "Content-Type": "application/json",
 }
 
 TABLE_CUSTOMERS   = "Customers"
@@ -35,6 +42,8 @@ print(f"[STARTUP] Customers table  : {TABLE_CUSTOMERS}")
 print(f"[STARTUP] Inventories table: {TABLE_INVENTORIES}")
 print(f"[STARTUP] Leads table      : {TABLE_LEADS}")
 print(f"[STARTUP] Webhook secret   : {'SET' if SHOPIFY_SECRET else 'NOT SET (verification skipped)'}")
+print(f"[STARTUP] Shopify store    : {SHOPIFY_STORE or 'NOT SET'}")
+print(f"[STARTUP] Shopify token    : {'SET' if SHOPIFY_ADMIN_TOKEN else 'NOT SET (sync disabled)'}")
 print("=" * 60)
 
 
@@ -147,6 +156,13 @@ def find_product_by_sku(sku: str) -> dict | None:
     return None
 
 
+def lead_exists_for_customer(customer_id: str) -> bool:
+    """Check if a lead already exists for this customer to avoid duplicates."""
+    formula = f"FIND('{customer_id}', ARRAYJOIN(Customers, ','))"
+    records = at_get(TABLE_LEADS, formula)
+    return len(records) > 0
+
+
 def create_lead(customer_id: str, product_ids: list[str], abandoned_date: str) -> dict:
     print(f"\n[LEAD CREATE] customer_id={customer_id}")
     print(f"[LEAD CREATE] product_ids={product_ids}")
@@ -162,29 +178,19 @@ def create_lead(customer_id: str, product_ids: list[str], abandoned_date: str) -
     return record
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Webhook route
-# ══════════════════════════════════════════════════════════════════════════════
+def process_single_checkout(checkout: dict) -> dict:
+    """
+    Shared logic used by both the webhook and the sync route.
+    Returns a result dict describing what happened.
+    """
+    checkout_id = checkout.get("id")
 
-@app.route("/webhook/abandoned-checkout", methods=["POST"])
-def abandoned_checkout():
-    print("\n" + "=" * 60)
-    print(f"[WEBHOOK] Received at {datetime.utcnow().isoformat()}Z")
+    # Skip completed checkouts
+    if checkout.get("completed_at"):
+        print(f"[PROCESS] Checkout {checkout_id} already completed — skipping")
+        return {"status": "skipped", "reason": "already completed", "checkout_id": checkout_id}
 
-    # Verify signature
-    if not verify_webhook(request.data, request.headers.get("X-Shopify-Hmac-SHA256", "")):
-        print("[WEBHOOK] Rejected — HMAC mismatch")
-        return jsonify({"error": "Unauthorized"}), 401
-
-    checkout = request.get_json(force=True)
-    if not checkout:
-        print("[WEBHOOK] No JSON payload")
-        return jsonify({"error": "No payload"}), 400
-
-    print(f"[WEBHOOK] Checkout ID   : {checkout.get('id')}")
-    print(f"[WEBHOOK] Checkout token: {checkout.get('token', 'N/A')}")
-
-    # Extract customer
+    # Extract contact info
     cust    = checkout.get("customer") or {}
     billing = checkout.get("billing_address") or {}
     first = (cust.get("first_name") or billing.get("first_name") or "").strip()
@@ -199,7 +205,7 @@ def abandoned_checkout():
 
     if not email and not phone:
         print("[EXTRACT] No contact info — skipping")
-        return jsonify({"skipped": "no contact info"}), 200
+        return {"status": "skipped", "reason": "no contact info", "checkout_id": checkout_id}
 
     # Parse date
     raw_date = checkout.get("created_at", "")
@@ -218,11 +224,13 @@ def abandoned_checkout():
     # STEP 1 — Find or create customer
     print("\n[STEP 1] Customer lookup...")
     customer_record = find_customer(phone, email)
+    customer_action = "found"
     if customer_record:
         print(f"[STEP 1] Existing customer: {customer_record['id']}")
     else:
         print("[STEP 1] Not found — creating new customer")
         customer_record = create_customer(name, phone, email)
+        customer_action = "created"
         print(f"[STEP 1] New customer: {customer_record['id']}")
     customer_id = customer_record["id"]
 
@@ -246,29 +254,177 @@ def abandoned_checkout():
 
     if not product_ids:
         print("[STEP 2] No matched products — lead NOT created")
-        return jsonify({
-            "warning":        "Customer saved but no SKUs matched in French Inventories",
-            "unmatched_skus": unmatched_skus,
+        return {
+            "status":         "skipped",
+            "reason":         "no matching SKUs",
+            "checkout_id":    checkout_id,
             "customer_id":    customer_id,
-        }), 200
+            "customer_action": customer_action,
+            "unmatched_skus": unmatched_skus,
+        }
 
     # STEP 3 — Create lead
     print("\n[STEP 3] Creating lead...")
     lead = create_lead(customer_id, product_ids, abandoned_date)
     lead_id = lead.get("id")
-
     print(f"\n[DONE] customer_id={customer_id}  lead_id={lead_id}  products={len(product_ids)}  unmatched={unmatched_skus}")
-    print("=" * 60)
 
-    return jsonify({
-        "success":         True,
+    return {
+        "status":          "success",
+        "checkout_id":     checkout_id,
         "customer_id":     customer_id,
+        "customer_action": customer_action,
         "lead_id":         lead_id,
         "products_linked": len(product_ids),
         "unmatched_skus":  unmatched_skus,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Webhook route  (handles new abandoned checkouts in real time)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/webhook/abandoned-checkout", methods=["POST"])
+def abandoned_checkout():
+    print("\n" + "=" * 60)
+    print(f"[WEBHOOK] Received at {datetime.utcnow().isoformat()}Z")
+
+    if not verify_webhook(request.data, request.headers.get("X-Shopify-Hmac-SHA256", "")):
+        print("[WEBHOOK] Rejected — HMAC mismatch")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    checkout = request.get_json(force=True)
+    if not checkout:
+        print("[WEBHOOK] No JSON payload")
+        return jsonify({"error": "No payload"}), 400
+
+    print(f"[WEBHOOK] Checkout ID   : {checkout.get('id')}")
+    print(f"[WEBHOOK] Checkout token: {checkout.get('token', 'N/A')}")
+
+    result = process_single_checkout(checkout)
+    print("=" * 60)
+
+    if result["status"] == "skipped":
+        return jsonify(result), 200
+    return jsonify(result), 200
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sync route  (backfill existing abandoned checkouts from Shopify)
+# Call: POST /sync/abandoned-checkouts
+# Optional JSON body: { "limit": 50 }   ← max checkouts to process (default all)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/sync/abandoned-checkouts", methods=["POST"])
+def sync_abandoned_checkouts():
+    print("\n" + "=" * 60)
+    print(f"[SYNC] Started at {datetime.utcnow().isoformat()}Z")
+
+    if not SHOPIFY_STORE or not SHOPIFY_ADMIN_TOKEN:
+        print("[SYNC] SHOPIFY_STORE or SHOPIFY_ADMIN_TOKEN not set")
+        return jsonify({"error": "SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN env vars required"}), 500
+
+    body       = request.get_json(force=True) or {}
+    max_limit  = body.get("limit", None)   # optional: stop after N checkouts
+    since_date = body.get("since", None)   # optional: only after this date e.g. "2026-01-01"
+
+    print(f"[SYNC] max_limit={max_limit}  since_date={since_date}")
+
+    stats = {
+        "fetched": 0, "success": 0,
+        "skipped_completed": 0, "skipped_no_contact": 0,
+        "skipped_no_sku": 0, "duplicate_lead": 0, "errors": 0,
+    }
+    results = []
+
+    # ── Fetch all open checkouts from Shopify (paginated) ─────────────────────
+    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-04/checkouts.json"
+    params = {"limit": 250, "status": "open"}
+    if since_date:
+        params["created_at_min"] = since_date
+
+    page = 1
+    done = False
+
+    while url and not done:
+        print(f"\n[SYNC] Fetching Shopify page {page}...")
+        resp = requests.get(url, headers=SHOPIFY_HEADERS, params=params)
+
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 2))
+            print(f"[SYNC] Rate limited — waiting {wait}s")
+            time.sleep(wait)
+            continue
+
+        if not resp.ok:
+            print(f"[SYNC] Shopify error: {resp.status_code} {resp.text}")
+            return jsonify({"error": f"Shopify API error: {resp.status_code}", "detail": resp.text}), 500
+
+        checkouts = resp.json().get("checkouts", [])
+        print(f"[SYNC] Page {page}: {len(checkouts)} checkouts received")
+
+        for checkout in checkouts:
+            stats["fetched"] += 1
+            print(f"\n[SYNC] ── Checkout #{checkout.get('id')} ({stats['fetched']}) ──")
+
+            # Check duplicate lead before processing
+            cust  = checkout.get("customer") or {}
+            phone = (cust.get("phone") or checkout.get("phone") or "").strip()
+            email = (cust.get("email") or checkout.get("email") or "").strip().lower()
+            existing_customer = find_customer(phone, email) if (phone or email) else None
+            if existing_customer and lead_exists_for_customer(existing_customer["id"]):
+                print(f"[SYNC] Lead already exists for customer {existing_customer['id']} — skipping")
+                stats["duplicate_lead"] += 1
+                results.append({"checkout_id": checkout.get("id"), "status": "skipped", "reason": "duplicate lead"})
+                continue
+
+            try:
+                result = process_single_checkout(checkout)
+                results.append(result)
+
+                if result["status"] == "success":
+                    stats["success"] += 1
+                elif result.get("reason") == "already completed":
+                    stats["skipped_completed"] += 1
+                elif result.get("reason") == "no contact info":
+                    stats["skipped_no_contact"] += 1
+                elif result.get("reason") == "no matching SKUs":
+                    stats["skipped_no_sku"] += 1
+
+            except Exception as e:
+                print(f"[SYNC] ERROR on checkout {checkout.get('id')}: {e}")
+                stats["errors"] += 1
+                results.append({"checkout_id": checkout.get("id"), "status": "error", "error": str(e)})
+
+            time.sleep(0.3)   # avoid rate limiting
+
+            if max_limit and stats["fetched"] >= max_limit:
+                print(f"[SYNC] Reached limit of {max_limit} — stopping")
+                done = True
+                break
+
+        # Pagination via Link header
+        link = resp.headers.get("Link", "")
+        url  = None
+        params = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+        page += 1
+
+    print(f"\n[SYNC] Complete — {stats}")
+    print("=" * 60)
+
+    return jsonify({
+        "sync_complete": True,
+        "stats":         stats,
+        "results":       results,
     }), 200
 
 
+# ── Health check ──────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     print("[HEALTH] Health check")
