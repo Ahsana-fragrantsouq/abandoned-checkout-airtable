@@ -168,8 +168,8 @@ def create_lead(customer_id: str, product_ids: list[str], abandoned_date: str) -
     print(f"[LEAD CREATE] product_ids={product_ids}")
     print(f"[LEAD CREATE] date={abandoned_date}")
     fields = {
-        "Customers":           [{"id": customer_id}],
-        "Interested products": [{"id": pid} for pid in product_ids],
+       "Customers":           [customer_id],
+        "Interested products": product_ids,
         "Lead created date":   abandoned_date,
         "Lead Source":         "Abandoned cart",
     }
