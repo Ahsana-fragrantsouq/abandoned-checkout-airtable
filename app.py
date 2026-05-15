@@ -315,7 +315,7 @@ def abandoned_checkout():
 # Optional JSON body: { "limit": 50 }   ← max checkouts to process (default all)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.route("/sync/abandoned-checkouts", methods=["POST"])
+@app.route("/sync/abandoned-checkouts", methods=["GET", "POST"])
 def sync_abandoned_checkouts():
     print("\n" + "=" * 60)
     print(f"[SYNC] Started at {datetime.utcnow().isoformat()}Z")
