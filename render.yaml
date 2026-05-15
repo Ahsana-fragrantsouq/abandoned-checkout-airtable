@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: shopify-airtable-abandoned-cart
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: AIRTABLE_TOKEN
+        sync: false          # you fill this in Render dashboard
+      - key: AIRTABLE_BASE_ID
+        sync: false
+      - key: SHOPIFY_WEBHOOK_SECRET
+        sync: false
