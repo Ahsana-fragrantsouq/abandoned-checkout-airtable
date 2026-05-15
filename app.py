@@ -183,7 +183,7 @@ def abandoned_checkout():
             print(f"[WEBHOOK] Checkout {checkout.get('id')} already completed — skipping")
             return jsonify({"skipped": "checkout already completed"}), 200
         print("[WEBHOOK] No JSON payload")
-        return jsonify({"error": "No payload"}), 400
+        return jsonify({"error": "No payload"}), 400  
 
     print(f"[WEBHOOK] Checkout ID   : {checkout.get('id')}")
     print(f"[WEBHOOK] Checkout token: {checkout.get('token', 'N/A')}")
@@ -271,6 +271,117 @@ def abandoned_checkout():
         "products_linked": len(product_ids),
         "unmatched_skus":  unmatched_skus,
     }), 200
+
+# sync
+
+@app.route("/sync/abandoned-checkouts", methods=["POST"])
+def sync_abandoned_checkouts():
+    print("\n" + "=" * 60)
+    print(f"[SYNC] Started at {datetime.utcnow().isoformat()}Z")
+
+    if not SHOPIFY_STORE or not SHOPIFY_ADMIN_TOKEN:
+        print("[SYNC] SHOPIFY_STORE or SHOPIFY_ADMIN_TOKEN not set")
+        return jsonify({"error": "SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN env vars required"}), 500
+
+    body       = request.get_json(force=True) or {}
+    max_limit  = body.get("limit", None)   # optional: stop after N checkouts
+    since_date = body.get("since", None)   # optional: only after this date e.g. "2026-01-01"
+
+    print(f"[SYNC] max_limit={max_limit}  since_date={since_date}")
+
+    stats = {
+        "fetched": 0, "success": 0,
+        "skipped_completed": 0, "skipped_no_contact": 0,
+        "skipped_no_sku": 0, "duplicate_lead": 0, "errors": 0,
+    }
+    results = []
+
+    # ── Fetch all open checkouts from Shopify (paginated) ─────────────────────
+    url    = f"https://{SHOPIFY_STORE}/admin/api/2024-04/checkouts.json"
+    params = {"limit": 250, "status": "open"}
+    if since_date:
+        params["created_at_min"] = since_date
+
+    page = 1
+    done = False
+
+    while url and not done:
+        print(f"\n[SYNC] Fetching Shopify page {page}...")
+        resp = requests.get(url, headers=SHOPIFY_HEADERS, params=params)
+
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 2))
+            print(f"[SYNC] Rate limited — waiting {wait}s")
+            time.sleep(wait)
+            continue
+
+        if not resp.ok:
+            print(f"[SYNC] Shopify error: {resp.status_code} {resp.text}")
+            return jsonify({"error": f"Shopify API error: {resp.status_code}", "detail": resp.text}), 500
+
+        checkouts = resp.json().get("checkouts", [])
+        print(f"[SYNC] Page {page}: {len(checkouts)} checkouts received")
+
+        for checkout in checkouts:
+            stats["fetched"] += 1
+            print(f"\n[SYNC] ── Checkout #{checkout.get('id')} ({stats['fetched']}) ──")
+
+            # Check duplicate lead before processing
+            cust  = checkout.get("customer") or {}
+            phone = (cust.get("phone") or checkout.get("phone") or "").strip()
+            email = (cust.get("email") or checkout.get("email") or "").strip().lower()
+            existing_customer = find_customer(phone, email) if (phone or email) else None
+            if existing_customer and lead_exists_for_customer(existing_customer["id"]):
+                print(f"[SYNC] Lead already exists for customer {existing_customer['id']} — skipping")
+                stats["duplicate_lead"] += 1
+                results.append({"checkout_id": checkout.get("id"), "status": "skipped", "reason": "duplicate lead"})
+                continue
+
+            try:
+                result = process_single_checkout(checkout)
+                results.append(result)
+
+                if result["status"] == "success":
+                    stats["success"] += 1
+                elif result.get("reason") == "already completed":
+                    stats["skipped_completed"] += 1
+                elif result.get("reason") == "no contact info":
+                    stats["skipped_no_contact"] += 1
+                elif result.get("reason") == "no matching SKUs":
+                    stats["skipped_no_sku"] += 1
+
+            except Exception as e:
+                print(f"[SYNC] ERROR on checkout {checkout.get('id')}: {e}")
+                stats["errors"] += 1
+                results.append({"checkout_id": checkout.get("id"), "status": "error", "error": str(e)})
+
+            time.sleep(0.3)   # avoid rate limiting
+
+            if max_limit and stats["fetched"] >= max_limit:
+                print(f"[SYNC] Reached limit of {max_limit} — stopping")
+                done = True
+                break
+
+        # Pagination via Link header
+        link = resp.headers.get("Link", "")
+        url  = None
+        params = {}
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split(";")[0].strip().strip("<>")
+                    break
+        page += 1
+
+    print(f"\n[SYNC] Complete — {stats}")
+    print("=" * 60)
+
+    return jsonify({
+        "sync_complete": True,
+        "stats":         stats,
+        "results":       results,
+    }), 200
+# end
 
 
 @app.route("/health", methods=["GET"])
